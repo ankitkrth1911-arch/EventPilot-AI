@@ -10,7 +10,7 @@ import json
 import logging
 import asyncio
 from datetime import date, datetime
-from typing import Literal, Optional, List, Dict, Any
+from typing import Literal, Optional, List, Dict, Any, Union
 from uuid import UUID
 from contextlib import asynccontextmanager
 
@@ -228,19 +228,20 @@ def calculate_budget_breakdown(event_type: EventType, total_budget: float) -> Li
 
 def generate_plan_rules(
     event_type: EventType,
-    budget: float,
-    guest_count: int,
-    event_date: Optional[date] = None
+    budget: Optional[float] = None,
+    guest_count: Optional[int] = None,
+    event_date: Optional[Union[date, str]] = None
 ) -> Dict[str, Any]:
     """
     Pure rule-based planning engine.
     Computes budget breakdown, per-guest costs, deterministic checklist, and warnings.
+    Always adds days_until_event to the plan dictionary whenever event_date is provided.
     """
-    total_budget = round(float(budget), 2)
-    guest_cnt = int(guest_count)
+    total_budget = round(float(budget), 2) if budget is not None else 0.0
+    guest_cnt = int(guest_count) if guest_count is not None else 0
 
     # Per guest cost (currency is INR ₹)
-    if guest_cnt > 0:
+    if guest_cnt > 0 and total_budget > 0:
         per_guest_cost = round(total_budget / guest_cnt, 2)
     else:
         per_guest_cost = 0.0
@@ -259,30 +260,38 @@ def generate_plan_rules(
 
     warnings: List[str] = []
 
-    # Timeline warning based on event_date
-    if event_date is not None:
-        days_until = (event_date - date.today()).days
-        if days_until < 0:
+    # Parse and compute days_until_event whenever event_date is provided
+    parsed_date = event_date
+    if isinstance(parsed_date, str):
+        try:
+            parsed_date = date.fromisoformat(parsed_date)
+        except Exception:
+            parsed_date = None
+
+    days_until_event = None
+    if parsed_date is not None:
+        days_until_event = (parsed_date - date.today()).days
+        if days_until_event < 0:
             warnings.append("Event date is in the past: please verify the scheduled event date.")
-        elif days_until < 30:
+        elif days_until_event < 30:
             warnings.append("Short timeline: prioritize venue, catering and invitations first.")
 
     # Low per-guest budget warnings
     if guest_cnt > 0:
-        if event_type == "wedding" and per_guest_cost < 1500.0:
+        if event_type == "wedding" and (per_guest_cost < 1500.0 or total_budget == 0.0):
             warnings.append("Low per-guest budget: weddings typically require at least ₹1,500 per guest for venue, food, and decor.")
-        elif event_type == "birthday" and per_guest_cost < 500.0:
+        elif event_type == "birthday" and (per_guest_cost < 500.0 or total_budget == 0.0):
             warnings.append("Low per-guest budget: birthday celebrations typically require at least ₹500 per guest.")
-        elif event_type == "community" and per_guest_cost < 150.0:
+        elif event_type == "community" and (per_guest_cost < 150.0 or total_budget == 0.0):
             warnings.append("Low per-guest budget: community events typically require at least ₹150 per guest.")
-    else:
+    elif total_budget > 0:
         warnings.append("Guest count is zero: plan assumes venue and basic fixed overhead costs only.")
 
     # High guest count with low budget warning
     if (guest_cnt >= 500 and total_budget < 100000.0) or (guest_cnt >= 200 and per_guest_cost < 200.0 and guest_cnt > 0):
         warnings.append("High guest count with a constrained budget: risk of cost overruns on catering and venue capacity.")
 
-    return {
+    plan_result: Dict[str, Any] = {
         "event_type": event_type,
         "total_budget": total_budget,
         "guest_count": guest_cnt,
@@ -292,6 +301,11 @@ def generate_plan_rules(
         "warnings": warnings,
         "generated_by": "rule-based-v1",
     }
+
+    if parsed_date is not None:
+        plan_result["days_until_event"] = days_until_event
+
+    return plan_result
 
 
 # ------------------------------------------------------------------------------
@@ -522,9 +536,9 @@ async def create_event(event: EventCreate, request: Request):
     """
     pool = await get_db_pool(request)
 
-    # Optional auto-plan generation if budget and guest_count are provided
+    # Always generate plan if event_date, budget, or guest_count is provided (or if creating an event)
     generated_plan = None
-    if event.budget is not None and event.guest_count is not None:
+    if event.event_date is not None or event.budget is not None or event.guest_count is not None:
         generated_plan = generate_plan_rules(
             event_type=event.event_type,
             budget=event.budget,
@@ -678,7 +692,8 @@ async def update_event(
     """
     Partially update an event by UUID.
     Only provided fields are updated.
-    If 'plan' is provided, it is merged via PostgreSQL JSONB concatenation (||).
+    If planning fields (event_date, budget, guest_count, event_type) or 'plan' are updated,
+    plan is recalculated with generate_plan_rules and merged so workspace/custom data is preserved.
     Returns the full updated event (200), 404 if not found, 422 if body is empty.
     """
     update_data = payload.model_dump(exclude_unset=True)
@@ -690,6 +705,63 @@ async def update_event(
 
     pool = await get_db_pool(request)
 
+    # 1. Fetch current event from database to verify existence and get context for plan recalculation
+    fetch_query = """
+        SELECT id, name, event_type, event_date, location, guest_count, budget, plan
+        FROM public.events
+        WHERE id = %s;
+    """
+    try:
+        async with pool.connection(timeout=3.0) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(fetch_query, (str(event_id),))
+                current = await cur.fetchone()
+    except Exception as exc:
+        logger.error("Error fetching event for update: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service unavailable"
+        )
+
+    if not current:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    # Current event values
+    eff_event_type = update_data.get("event_type", current["event_type"])
+    eff_event_date = update_data["event_date"] if "event_date" in update_data else current["event_date"]
+    eff_budget = update_data["budget"] if "budget" in update_data else current["budget"]
+    eff_guest_count = update_data["guest_count"] if "guest_count" in update_data else current["guest_count"]
+
+    current_plan = current["plan"]
+    if isinstance(current_plan, str):
+        try:
+            current_plan = json.loads(current_plan)
+        except Exception:
+            current_plan = {}
+    elif current_plan is None:
+        current_plan = {}
+
+    # Check if any planning-relevant field was updated
+    plan_relevant_fields = {"event_type", "event_date", "budget", "guest_count"}
+    has_plan_field_update = any(f in update_data for f in plan_relevant_fields)
+
+    # If plan-relevant fields changed, recalculate plan rules using the shared function
+    if has_plan_field_update:
+        rule_plan = generate_plan_rules(
+            event_type=eff_event_type,
+            budget=eff_budget,
+            guest_count=eff_guest_count,
+            event_date=eff_event_date
+        )
+        if eff_event_date is None:
+            current_plan.pop("days_until_event", None)
+        current_plan.update(rule_plan)
+
+    # If payload explicitly supplied 'plan', merge it on top (preserving workspace/custom data)
+    if "plan" in update_data and update_data["plan"] is not None:
+        current_plan.update(update_data["plan"])
+
+    # Build SET clauses and parameters for SQL UPDATE
     set_clauses: List[str] = []
     params: List[Any] = []
 
@@ -697,11 +769,14 @@ async def update_event(
         if field_name not in ALLOWED_UPDATE_FIELDS:
             continue
         if field_name == "plan":
-            set_clauses.append("plan = coalesce(plan, '{}'::jsonb) || %s::jsonb")
-            params.append(json.dumps(value))
-        else:
-            set_clauses.append(f"{field_name} = %s")
-            params.append(value)
+            continue
+        set_clauses.append(f"{field_name} = %s")
+        params.append(value)
+
+    # If plan was recalculated or explicitly provided, add plan update
+    if has_plan_field_update or ("plan" in update_data):
+        set_clauses.append("plan = %s::jsonb")
+        params.append(json.dumps(current_plan))
 
     if not set_clauses:
         raise HTTPException(
