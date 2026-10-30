@@ -3,6 +3,7 @@ import { BackendEventRow } from './api';
 
 /**
  * Maps a frontend EventItem (or partial update) to the backend database schema.
+ * Accurately handles partial updates so PATCH doesn't inadvertently overwrite workspace data.
  */
 export function toBackend(event: Partial<EventItem>): {
   name?: string;
@@ -26,27 +27,36 @@ export function toBackend(event: Partial<EventItem>): {
     payload.budget = Number.isFinite(event.totalBudget) ? Number(event.totalBudget) : null;
   }
 
-  // Construct workspace payload inside plan
-  const workspace: any = {
-    venueName: event.venueName ?? '',
-    startTime: event.startTime ?? '10:00',
-    endTime: event.endTime ?? '18:00',
-    description: event.description ?? '',
-    coverImage: event.coverImage ?? '',
-    hostName: event.hostName ?? '',
-    hostEmail: event.hostEmail ?? '',
-    currency: event.currency ?? 'INR',
-    timeline: event.timeline ?? [],
-    budgetItems: event.budgetItems ?? [],
-    guests: event.guests ?? [],
-    tasks: event.tasks ?? [],
-    vendors: event.vendors ?? [],
-  };
+  // Check if workspace fields are provided
+  const workspaceProps: (keyof EventItem)[] = [
+    'venueName', 'startTime', 'endTime', 'description', 'coverImage',
+    'hostName', 'hostEmail', 'currency', 'timeline', 'budgetItems',
+    'guests', 'tasks', 'vendors'
+  ];
 
-  payload.plan = {
-    workspace,
-    ...(event.ruleBasedPlan ? { rule_based: event.ruleBasedPlan } : {}),
-  };
+  const hasWorkspaceProps = workspaceProps.some((prop) => event[prop] !== undefined);
+
+  if (hasWorkspaceProps || event.ruleBasedPlan) {
+    const workspace: Record<string, any> = {};
+    if (event.venueName !== undefined) workspace.venueName = event.venueName;
+    if (event.startTime !== undefined) workspace.startTime = event.startTime;
+    if (event.endTime !== undefined) workspace.endTime = event.endTime;
+    if (event.description !== undefined) workspace.description = event.description;
+    if (event.coverImage !== undefined) workspace.coverImage = event.coverImage;
+    if (event.hostName !== undefined) workspace.hostName = event.hostName;
+    if (event.hostEmail !== undefined) workspace.hostEmail = event.hostEmail;
+    if (event.currency !== undefined) workspace.currency = event.currency;
+    if (event.timeline !== undefined) workspace.timeline = event.timeline;
+    if (event.budgetItems !== undefined) workspace.budgetItems = event.budgetItems;
+    if (event.guests !== undefined) workspace.guests = event.guests;
+    if (event.tasks !== undefined) workspace.tasks = event.tasks;
+    if (event.vendors !== undefined) workspace.vendors = event.vendors;
+
+    payload.plan = {
+      ...(hasWorkspaceProps ? { workspace } : {}),
+      ...(event.ruleBasedPlan ? { rule_based: event.ruleBasedPlan } : {}),
+    };
+  }
 
   return payload;
 }
@@ -92,6 +102,7 @@ export function fromBackend(row: BackendEventRow): EventItem {
     targetGuests: typeof row.guest_count === 'number' ? row.guest_count : 0,
     totalBudget: budgetNumber,
     createdAt: row.created_at || new Date().toISOString(),
+    _etag: row._etag,
 
     // Workspace fields with safe defaults
     venueName: typeof workspace.venueName === 'string' ? workspace.venueName : '',

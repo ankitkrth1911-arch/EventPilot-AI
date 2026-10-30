@@ -42,6 +42,9 @@ export default function App() {
   const lastSavedEventsRef = useRef<Map<string, EventItem>>(new Map());
   // Debounce timers per event
   const debounceTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
+  // Abort controllers per event for canceling stale in-flight PATCHes
+  const patchAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const fetchAbortControllerRef = useRef<AbortController | null>(null);
   const saveTimeoutIndicatorRef = useRef<NodeJS.Timeout | null>(null);
 
   const showToast = (msg: string) => {
@@ -77,11 +80,17 @@ export default function App() {
       return;
     }
 
+    if (fetchAbortControllerRef.current) {
+      fetchAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    fetchAbortControllerRef.current = controller;
+
     setIsLoading(true);
     setLoadError(null);
     try {
       await checkHealth();
-      const rows = await listEvents({ limit: 200 });
+      const rows = await listEvents({ limit: 200 }, controller.signal);
       const mapped = rows.map(fromBackend);
       setEvents(mapped);
 
@@ -92,6 +101,7 @@ export default function App() {
       }
       lastSavedEventsRef.current = map;
     } catch (err: any) {
+      if (err.name === 'AbortError') return;
       console.error('Failed to load events:', err);
       setLoadError(err.message || 'Failed to connect to the backend server.');
     } finally {
@@ -134,7 +144,7 @@ export default function App() {
   // Selected event accessor
   const selectedEvent = events.find((e) => e.id === selectedEventId) || null;
 
-  // CREATE EVENT (POST)
+  // CREATE EVENT (POST WITH IDEMPOTENCY KEY)
   const handleCreateEvent = async (data: {
     title: string;
     category: EventCategory;
@@ -174,15 +184,19 @@ export default function App() {
       ruleBasedPlan: data.ruleBasedPlan,
     });
 
-    const createdRow = await createEvent({
-      name: backendPayload.name!,
-      event_type: backendPayload.event_type!,
-      event_date: backendPayload.event_date,
-      location: backendPayload.location,
-      guest_count: backendPayload.guest_count,
-      budget: backendPayload.budget,
-      plan: backendPayload.plan,
-    });
+    const idempotencyKey = `create-event-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    const createdRow = await createEvent(
+      {
+        name: backendPayload.name!,
+        event_type: backendPayload.event_type!,
+        event_date: backendPayload.event_date,
+        location: backendPayload.location,
+        guest_count: backendPayload.guest_count,
+        budget: backendPayload.budget,
+        plan: backendPayload.plan,
+      },
+      idempotencyKey
+    );
 
     const mapped = fromBackend(createdRow);
     setEvents((prev) => [mapped, ...prev]);
@@ -191,7 +205,7 @@ export default function App() {
     setCurrentView('event-detail');
   };
 
-  // UPDATE EVENT (OPTIMISTIC + 600ms DEBOUNCED PATCH)
+  // UPDATE EVENT (OPTIMISTIC + 600ms DEBOUNCED PATCH WITH ABORTION & ETAG)
   const handleUpdateEvent = (updated: EventItem) => {
     const eventId = updated.id;
 
@@ -204,28 +218,60 @@ export default function App() {
     setSaveStatus('saving');
     if (saveTimeoutIndicatorRef.current) clearTimeout(saveTimeoutIndicatorRef.current);
 
-    // 2. Clear existing debounce timer for this event
+    // 2. Abort any existing in-flight PATCH for this event
+    const activeController = patchAbortControllersRef.current.get(eventId);
+    if (activeController) {
+      activeController.abort();
+      patchAbortControllersRef.current.delete(eventId);
+    }
+
+    // 3. Clear existing debounce timer for this event
     const existingTimer = debounceTimersRef.current.get(eventId);
     if (existingTimer) clearTimeout(existingTimer);
 
-    // 3. Schedule PATCH after 600 ms
+    // 4. Schedule PATCH after 600 ms
     const timer = setTimeout(async () => {
+      const controller = new AbortController();
+      patchAbortControllersRef.current.set(eventId, controller);
+
       try {
         const payload = toBackend(updated);
-        const patchedRow = await updateEvent(eventId, payload);
+        const patchedRow = await updateEvent(eventId, payload, updated._etag, controller.signal);
         const latestMapped = fromBackend(patchedRow);
 
-        // Update last saved snapshot
+        // Update last saved snapshot & local event state with latest ETag
         lastSavedEventsRef.current.set(eventId, latestMapped);
+        setEvents((prev) => prev.map((e) => (e.id === eventId ? latestMapped : e)));
+        if (rsvpEvent && rsvpEvent.id === eventId) {
+          setRsvpEvent(latestMapped);
+        }
 
         setSaveStatus('saved');
         saveTimeoutIndicatorRef.current = setTimeout(() => {
           setSaveStatus(null);
         }, 2000);
       } catch (err: any) {
+        if (err.name === 'AbortError') return;
+
         console.error(`Failed to persist changes to event ${eventId}:`, err);
-        showToast('Could not save changes');
         setSaveStatus(null);
+
+        if (err.status === 412) {
+          showToast('This event was updated in another session. Reloading latest data...');
+          try {
+            const freshRow = await getEvent(eventId);
+            const freshMapped = fromBackend(freshRow);
+            lastSavedEventsRef.current.set(eventId, freshMapped);
+            setEvents((prev) => prev.map((e) => (e.id === eventId ? freshMapped : e)));
+            return;
+          } catch {
+            // fallback to rollback
+          }
+        } else if (err.status === 429 || err.status === 503) {
+          showToast(err.message || 'Server is busy. Changes could not be saved right now.');
+        } else {
+          showToast(err.message || 'Could not save changes');
+        }
 
         // Roll back to last saved version
         const lastSaved = lastSavedEventsRef.current.get(eventId);
@@ -237,6 +283,7 @@ export default function App() {
         }
       } finally {
         debounceTimersRef.current.delete(eventId);
+        patchAbortControllersRef.current.delete(eventId);
       }
     }, 600);
 

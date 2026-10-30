@@ -101,6 +101,7 @@ export interface EventItem {
   vendors: VendorItem[];
   ruleBasedPlan?: RuleBasedPlanMeta;
   createdAt: string;
+  _etag?: string;
 }
 
 export const CATEGORY_THEMES: Record<EventCategory, CategoryTheme> = {
