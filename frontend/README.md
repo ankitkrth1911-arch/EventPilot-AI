@@ -63,4 +63,4 @@ The frontend connects to the following FastAPI REST routes:
    - Build Command: `npm run build`
    - Output Directory: `dist`
    - Install Command: `npm install`
-5. **CORS Note**: Ensure your FastAPI backend's `ALLOWED_ORIGINS` configuration includes your Vercel deployment URL (e.g., `https://eventpilot-ai.vercel.app` or `*`) to permit cross-origin requests.
+5. **CORS Note**: Ensure your FastAPI backend's `ALLOWED_ORIGINS` configuration includes your Vercel deployment URL (e.g., `https://eventpilot-ai.vercel.app`) to permit cross-origin requests. Wildcard `*` origins are forbidden in production.

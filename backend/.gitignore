@@ -19,9 +19,9 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+*.log
 
-# Git and IDE configs
-.git
+# IDE configs
 .idea/
 .vscode/
 *.swp
