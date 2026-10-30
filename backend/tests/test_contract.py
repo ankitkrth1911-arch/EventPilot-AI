@@ -298,7 +298,17 @@ async def test_idempotency_key(client: httpx.AsyncClient):
 
 @pytest.mark.asyncio
 async def test_system_probes_and_security_headers(client: httpx.AsyncClient):
-    """Test /livez, /health, security headers, and request ID tracking."""
+    """Test /, HEAD /, /livez, /health, security headers, and request ID tracking."""
+    # Root GET probe
+    root_get = await client.get("/")
+    assert root_get.status_code == 200
+    assert "message" in root_get.json()
+
+    # Root HEAD probe returns 200 and empty body
+    root_head = await client.head("/")
+    assert root_head.status_code == 200
+    assert root_head.text == ""
+
     # Livez probe
     livez_resp = await client.get("/livez")
     assert livez_resp.status_code == 200
@@ -385,3 +395,42 @@ async def test_request_size_limit_413(client: httpx.AsyncClient):
     )
     assert resp.status_code == 413
     assert resp.json()["error"] == "Request body exceeds maximum size of 1 MB"
+
+
+@pytest.mark.asyncio
+async def test_db_host_and_error_sanitization(client: httpx.AsyncClient, caplog):
+    """Test database HOST extraction, message sanitization, and /health failure logging."""
+    from main import extract_db_host, sanitize_db_error_message, PoolTimeout
+
+    # 1. Host extraction only
+    assert extract_db_host("postgresql://myuser:mypassword123@aws-0-us-east-1.pooler.supabase.com:6543/postgres") == "aws-0-us-east-1.pooler.supabase.com"
+    assert extract_db_host("memory://") == "memory"
+    assert extract_db_host("") == "none"
+
+    # 2. Error message sanitization
+    class FakeAuthError(Exception): pass
+    assert sanitize_db_error_message(FakeAuthError('FATAL: password authentication failed for user "myuser"')) == "password authentication failed"
+
+    class FakeTenantError(Exception): pass
+    assert sanitize_db_error_message(FakeTenantError("FATAL: Tenant or user not found")) == "tenant or user not found"
+
+    class FakeHostError(Exception): pass
+    assert sanitize_db_error_message(FakeHostError('could not translate host name "db.xyz.supabase.co"')) == "could not translate host name"
+
+    assert sanitize_db_error_message(PoolTimeout("timed out")) == "connection timed out"
+
+    # 3. Health check failure logging
+    class BrokenPool:
+        def connection(self, timeout=3.0):
+            import psycopg
+            raise psycopg.OperationalError('connection failed: password authentication failed for user "superadmin"')
+
+    app.state.pool = BrokenPool()
+    with caplog.at_level("WARNING"):
+        res = await client.get("/health")
+        assert res.status_code == 503
+        assert res.json() == {"status": "degraded", "database": "unreachable"}
+
+    assert any("OperationalError" in r.message and "password authentication failed" in r.message for r in caplog.records)
+    for r in caplog.records:
+        assert "superadmin" not in r.message

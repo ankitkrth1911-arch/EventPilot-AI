@@ -13,6 +13,8 @@ import math
 import hashlib
 import asyncio
 import logging
+import re
+from urllib.parse import urlsplit
 from datetime import date, datetime, timezone
 from typing import Literal, Optional, List, Dict, Any, Union, Set
 from uuid import UUID
@@ -35,7 +37,20 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from psycopg.rows import dict_row
 
 # Load local environment variables from .env if present
-load_dotenv()
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+_local_env = os.path.join(_backend_dir, ".env")
+if os.path.isfile(_local_env):
+    try:
+        load_dotenv(_local_env)
+    except Exception:
+        pass
+else:
+    _root_env = os.path.join(os.path.dirname(_backend_dir), ".env")
+    if os.path.isfile(_root_env):
+        try:
+            load_dotenv(_root_env)
+        except Exception:
+            pass
 
 # Setup structured logging
 logging.basicConfig(
@@ -73,6 +88,68 @@ RATE_LIMIT_BURSTS = int(os.getenv("RATE_LIMIT_BURSTS", "10"))
 MAX_REQUEST_BODY_BYTES = 1024 * 1024  # 1 MB
 MAX_PLAN_SIZE_BYTES = 512 * 1024      # 512 KB
 MAX_PLAN_DEPTH = 10
+
+
+def extract_db_host(raw_url: str) -> str:
+    """Extract and return only the database host, never passwords, users, or full URLs."""
+    url = raw_url.strip().strip("'\"")
+    if not url:
+        return "none"
+    if url.startswith("memory://"):
+        return "memory"
+    try:
+        parsed = urlsplit(url)
+        if parsed.hostname:
+            return parsed.hostname
+    except Exception:
+        pass
+    match = re.search(r'\b(?:host|hostname)\s*=\s*([^\s;]+)', url, re.IGNORECASE)
+    if match:
+        return match.group(1).strip("'\"")
+    return "unknown"
+
+
+def sanitize_db_error_message(exc: Exception) -> str:
+    """
+    Sanitize exception message to remove database URL, user, and password,
+    extracting clean diagnostic descriptions.
+    """
+    if isinstance(exc, PoolTimeout):
+        return "connection timed out"
+
+    raw_msg = str(exc)
+    msg_lower = raw_msg.lower()
+
+    if "password authentication failed" in msg_lower:
+        return "password authentication failed"
+    if "tenant or user not found" in msg_lower:
+        return "tenant or user not found"
+    if "could not translate host name" in msg_lower:
+        return "could not translate host name"
+    if "connection timed out" in msg_lower or "timed out" in msg_lower or "timeout" in msg_lower:
+        return "connection timed out"
+    if "connection refused" in msg_lower:
+        return "connection refused"
+
+    # Redact raw DATABASE_URL if present anywhere in the message
+    sanitized = raw_msg
+    if RAW_DATABASE_URL and RAW_DATABASE_URL in sanitized:
+        sanitized = sanitized.replace(RAW_DATABASE_URL, "[REDACTED_URL]")
+
+    # Redact full URLs (e.g., postgresql://user:pass@host:port/dbname)
+    sanitized = re.sub(r'[a-zA-Z][a-zA-Z0-9+.-]+://[^\s\'"<>]+', '[REDACTED_URL]', sanitized)
+
+    # Redact connection parameters
+    sanitized = re.sub(r'(?:password|pwd)\s*=\s*[^\s,;]+', 'password=[REDACTED]', sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r'(?:user|username)\s*=\s*[^\s,;]+', 'user=[REDACTED]', sanitized, flags=re.IGNORECASE)
+
+    # Redact user/role mentions
+    sanitized = re.sub(r'for user\s+["\']?[^"\'\s,;]+["\']?', 'for user [REDACTED]', sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r'role\s+["\']?[^"\'\s,;]+["\']?', 'role [REDACTED]', sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r'user\s+["\']?[^"\'\s,;]+["\']?', 'user [REDACTED]', sanitized, flags=re.IGNORECASE)
+
+    cleaned = " ".join(sanitized.split())
+    return cleaned if cleaned else "database connection failed"
 
 
 def get_allowed_origins() -> List[str]:
@@ -769,6 +846,10 @@ async def lifespan(app: FastAPI):
     app.state.pool = None
     app.state.is_mock_db = False
 
+    # Log database HOST only, once at startup. Never log DATABASE_URL.
+    db_host = extract_db_host(RAW_DATABASE_URL)
+    logger.info("Database host: %s", db_host)
+
     if os.getenv("TEST_MODE") == "true" or RAW_DATABASE_URL.startswith("memory://"):
         app.state.pool = MockPool(memory_store)
         app.state.is_mock_db = True
@@ -799,7 +880,9 @@ async def lifespan(app: FastAPI):
             app.state.pool = pool
             logger.info("Database connection pool initialized (max_size=%s)", DB_POOL_MAX)
         except Exception as exc:
-            logger.warning("Could not initialize connection pool: %s", type(exc).__name__)
+            exc_class = type(exc).__name__
+            sanitized_msg = sanitize_db_error_message(exc)
+            logger.warning("Could not initialize connection pool [%s]: %s", exc_class, sanitized_msg)
             app.state.pool = None
     else:
         logger.warning("DATABASE_URL not set or placeholder; starting in database-degraded mode")
@@ -812,7 +895,9 @@ async def lifespan(app: FastAPI):
             await pool.close()
             logger.info("Database connection pool cleanly closed on shutdown")
         except Exception as exc:
-            logger.error("Error during pool shutdown: %s", type(exc).__name__)
+            exc_class = type(exc).__name__
+            sanitized_msg = sanitize_db_error_message(exc)
+            logger.error("Error during pool shutdown [%s]: %s", exc_class, sanitized_msg)
 
 
 # ------------------------------------------------------------------------------
@@ -832,7 +917,18 @@ app = FastAPI(
 # ------------------------------------------------------------------------------
 # Middlewares: Request ID, Concurrency Limiter, Request Size, Rate Limit, Security Headers
 # ------------------------------------------------------------------------------
-concurrency_semaphore = asyncio.Semaphore(MAX_INFLIGHT)
+_semaphores: Dict[Any, asyncio.Semaphore] = {}
+
+def get_concurrency_semaphore() -> asyncio.Semaphore:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.Semaphore(MAX_INFLIGHT)
+    sem = _semaphores.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_INFLIGHT)
+        _semaphores[loop] = sem
+    return sem
 in_flight_count = 0
 
 
@@ -876,9 +972,10 @@ async def root_security_and_traffic_middleware(request: Request, call_next):
 
     # 3. Global Concurrency Limiting (Load Shedding via 503 + Retry-After)
     acquired = False
+    sem = get_concurrency_semaphore()
     try:
         try:
-            await asyncio.wait_for(concurrency_semaphore.acquire(), timeout=0.01)
+            await asyncio.wait_for(sem.acquire(), timeout=0.01)
             acquired = True
             in_flight_count += 1
         except (asyncio.TimeoutError, Exception):
@@ -917,7 +1014,7 @@ async def root_security_and_traffic_middleware(request: Request, call_next):
 
     finally:
         if acquired:
-            concurrency_semaphore.release()
+            sem.release()
             in_flight_count = max(0, in_flight_count - 1)
 
     duration_ms = (time.time() - start_time) * 1000
@@ -956,7 +1053,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
@@ -1023,6 +1120,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def get_db_pool(request: Request) -> AsyncConnectionPool:
     pool: Optional[AsyncConnectionPool] = getattr(request.app.state, "pool", None)
     if pool is None:
+        logger.warning("Database connection failed [ConnectionError]: database pool uninitialized")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database service unavailable"
@@ -1042,6 +1140,7 @@ async def livez():
 async def health(request: Request):
     pool: Optional[AsyncConnectionPool] = getattr(request.app.state, "pool", None)
     if pool is None:
+        logger.warning("Database connection failed [ConnectionError]: database pool uninitialized")
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "degraded", "database": "unreachable"}
@@ -1054,7 +1153,9 @@ async def health(request: Request):
                 await cur.fetchone()
         return {"status": "ok", "database": "connected"}
     except Exception as exc:
-        logger.warning("Database health check ping failed: %s", type(exc).__name__)
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.warning("Database health check ping failed [%s]: %s", exc_class, sanitized_msg)
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "degraded", "database": "unreachable"}
@@ -1110,7 +1211,7 @@ async def test_db_outage(request: Request, broken: bool = Query(True)):
 # ------------------------------------------------------------------------------
 # Core API Endpoints
 # ------------------------------------------------------------------------------
-@app.get("/", summary="Root Endpoint")
+@app.api_route("/", methods=["GET", "HEAD"], summary="Root Endpoint")
 async def root():
     return {
         "message": "Welcome to EventPilot AI API",
@@ -1174,14 +1275,19 @@ async def create_event(event: EventCreate, request: Request, response: Response)
                 row = await cur.fetchone()
                 if hasattr(conn, "commit"):
                     await conn.commit()
-    except PoolTimeout:
+    except PoolTimeout as exc:
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.warning("Database connection pool timeout [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server busy, retry shortly",
             headers={"Retry-After": "2"}
         )
     except Exception as exc:
-        logger.error("Error creating event: %s", type(exc).__name__)
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.error("Error creating event [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database service unavailable"
@@ -1240,14 +1346,19 @@ async def list_events(
                 await cur.execute(full_query, params)
                 rows = await cur.fetchall()
                 return rows
-    except PoolTimeout:
+    except PoolTimeout as exc:
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.warning("Database connection pool timeout [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server busy, retry shortly",
             headers={"Retry-After": "2"}
         )
     except Exception as exc:
-        logger.error("Error listing events: %s", type(exc).__name__)
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.error("Error listing events [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database service unavailable"
@@ -1277,14 +1388,19 @@ async def get_event(
             async with conn.cursor() as cur:
                 await cur.execute(query, (str(event_id),))
                 row = await cur.fetchone()
-    except PoolTimeout:
+    except PoolTimeout as exc:
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.warning("Database connection pool timeout [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server busy, retry shortly",
             headers={"Retry-After": "2"}
         )
     except Exception as exc:
-        logger.error("Error retrieving event: %s", type(exc).__name__)
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.error("Error retrieving event [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database service unavailable"
@@ -1342,14 +1458,19 @@ async def update_event(
             async with conn.cursor() as cur:
                 await cur.execute(fetch_query, (str(event_id),))
                 current = await cur.fetchone()
-    except PoolTimeout:
+    except PoolTimeout as exc:
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.warning("Database connection pool timeout [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server busy, retry shortly",
             headers={"Retry-After": "2"}
         )
     except Exception as exc:
-        logger.error("Error fetching event for update: %s", type(exc).__name__)
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.error("Error fetching event for update [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database service unavailable"
@@ -1444,14 +1565,19 @@ async def update_event(
                 row = await cur.fetchone()
                 if hasattr(conn, "commit"):
                     await conn.commit()
-    except PoolTimeout:
+    except PoolTimeout as exc:
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.warning("Database connection pool timeout [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server busy, retry shortly",
             headers={"Retry-After": "2"}
         )
     except Exception as exc:
-        logger.error("Error updating event: %s", type(exc).__name__)
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.error("Error updating event [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database service unavailable"
@@ -1483,14 +1609,19 @@ async def delete_event(
                 row = await cur.fetchone()
                 if hasattr(conn, "commit"):
                     await conn.commit()
-    except PoolTimeout:
+    except PoolTimeout as exc:
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.warning("Database connection pool timeout [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server busy, retry shortly",
             headers={"Retry-After": "2"}
         )
     except Exception as exc:
-        logger.error("Error deleting event: %s", type(exc).__name__)
+        exc_class = type(exc).__name__
+        sanitized_msg = sanitize_db_error_message(exc)
+        logger.error("Error deleting event [%s]: %s", exc_class, sanitized_msg)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database service unavailable"
@@ -1530,14 +1661,19 @@ async def generate_plan(payload: PlanGenerateRequest, request: Request):
                     row = await cur.fetchone()
                     if hasattr(conn, "commit"):
                         await conn.commit()
-        except PoolTimeout:
+        except PoolTimeout as exc:
+            exc_class = type(exc).__name__
+            sanitized_msg = sanitize_db_error_message(exc)
+            logger.warning("Database connection pool timeout [%s]: %s", exc_class, sanitized_msg)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server busy, retry shortly",
                 headers={"Retry-After": "2"}
             )
         except Exception as exc:
-            logger.error("Error saving plan to event: %s", type(exc).__name__)
+            exc_class = type(exc).__name__
+            sanitized_msg = sanitize_db_error_message(exc)
+            logger.error("Error saving plan to event [%s]: %s", exc_class, sanitized_msg)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Database service unavailable"
