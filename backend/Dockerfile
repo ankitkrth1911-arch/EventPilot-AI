@@ -30,5 +30,5 @@ USER appuser
 # Expose API port
 EXPOSE 8000
 
-# Run FastAPI via Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run FastAPI via Uvicorn with proxy headers, concurrency limiting, and keep-alive timeout
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*", "--timeout-keep-alive", "30", "--limit-concurrency", "60"]
