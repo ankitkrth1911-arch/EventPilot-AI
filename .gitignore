@@ -1,27 +1,37 @@
-# Environment variables and secrets (NEVER commit real credentials)
+# Secrets and Environment Variables (NEVER commit real credentials)
 .env
 .env.*
 !.env.example
+*.env
+*.env.*
+!*.env.example
 
-# Python cache and bytecode
+# Junctions and zip archives
+eventpilot-backend
+*.zip
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# Virtual environments
-venv/
 .venv/
+venv/
 env/
-ENV/
-
-# Testing and coverage
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Git and IDE configs
-.git
+# Node / Frontend
+node_modules/
+dist/
+build/
+coverage/
+.DS_Store
+*.log
+.aistudio/
+
+# IDE
 .idea/
 .vscode/
 *.swp
