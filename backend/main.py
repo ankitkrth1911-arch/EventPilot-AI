@@ -1094,6 +1094,19 @@ async def get_internal_metrics(request: Request):
     return metrics.get_summary(in_flight=in_flight_count, pool_stats=pool_stats)
 
 
+@app.post("/internal/test-db-outage", summary="Simulate DB outage for load & SRE testing")
+async def test_db_outage(request: Request, broken: bool = Query(True)):
+    if broken:
+        request.app.state._saved_pool = getattr(request.app.state, "pool", None)
+        request.app.state.pool = None
+        return {"simulated_outage": True}
+    else:
+        saved = getattr(request.app.state, "_saved_pool", None)
+        if saved:
+            request.app.state.pool = saved
+        return {"simulated_outage": False}
+
+
 # ------------------------------------------------------------------------------
 # Core API Endpoints
 # ------------------------------------------------------------------------------
